@@ -16,7 +16,7 @@ pip install -r requirements.txt
 echo "TWITCH_CLIENT_ID=your_id" > .env
 echo "TWITCH_CLIENT_SECRET=your_secret" >> .env
 
-# 3. Full historical ingestion (2022–2025, all months) — both output files
+# 3. Full historical ingestion (2022–2025, all months) → both output files
 python main.py --mode full
 
 # 4. Resume after any interruption
@@ -30,7 +30,7 @@ python main.py --mode full --years 2024 --months january
 
 ## Output Files
 
-The pipeline runs three phases sequentially and produces two deliverables:
+The pipeline runs three phases and produces two deliverables:
 
 ```
 data/
@@ -39,28 +39,26 @@ data/
 └── twitch_monthly_fact_table_final.csv     ← Deliverable 2  (Phase 3)
 ```
 
-| File | Rows | Contents |
-|------|------|----------|
-| `twitch_monthly_fact_table.csv` | 24,000 | Leaderboard metadata + top-5 pie charts (÷4 corrected) |
-| `twitch_monthly_fact_table_enriched.csv` | 24,000 | Above + full games breakdown from games table API |
-| `twitch_monthly_fact_table_final.csv` | 24,000 | Above + cohort ranks, `streams` column dropped |
+| File | Contents |
+|------|----------|
+| `twitch_monthly_fact_table.csv` | Leaderboard metadata + all-games pie charts (÷4 corrected) |
+| `twitch_monthly_fact_table_enriched.csv` | Above + full games table from games API |
+| `twitch_monthly_fact_table_final.csv` | Above + cohort ranks + derived game features |
 
 ---
 
-## Schema
+## Schema — Final Output (`twitch_monthly_fact_table_final.csv`)
 
-### Phase 1 — `twitch_monthly_fact_table.csv` (23 columns)
-
-#### Identity
+### Identity
 | Column | Description |
 |--------|-------------|
-| `year` | 2022 – 2025 |
+| `year` | 2022–2025 |
 | `month` | january – december |
 | `channel_id` | SullyGnome internal channel ID |
 | `channel_slug` | URL slug (e.g. `xqc`) |
-| `display_name` | Channel display name |
+| `display_name` | Display name |
 
-#### Performance Metrics
+### Performance Metrics
 | Column | Description |
 |--------|-------------|
 | `rank_position` | Leaderboard rank 1–500 for that month |
@@ -69,18 +67,17 @@ data/
 | `average_viewers` | Average concurrent viewers |
 | `peak_viewers` | Peak concurrent viewers |
 | `hours_streamed` | Total hours streamed (`streamedminutes ÷ 60`) |
-| `hours_watched` | Total viewer-hours (`viewminutes ÷ 60`) |
-| `streams` | Always empty — not available from any SullyGnome API |
+| `hours_watched` | Total hours watched by all viewers (`viewminutes ÷ 60`) |
 
-#### Channel Metadata
+### Channel Metadata
 | Column | Description |
 |--------|-------------|
 | `status` | Channel status |
 | `mature` | Mature content flag |
-| `language` | Primary broadcast language |
-| `created` | Twitch account creation date (requires `.env` credentials, otherwise empty) |
+| `language` | Primary language |
+| `created` | Twitch account creation date (requires Twitch API credentials) |
 
-#### Cohort Ranks *(empty in Phase 1 — populated by Phase 3 transformer)*
+### Cohort Ranks *(computed per year+month group, highest value = Rank 1)*
 | Column | Description |
 |--------|-------------|
 | `peak_viewer_rank` | Rank by peak viewers within the month's Top 500 |
@@ -88,80 +85,76 @@ data/
 | `follower_rank` | Rank by total followers within the month's Top 500 |
 | `follower_gain_rank` | Rank by followers gained within the month's Top 500 |
 
-#### Game Breakdown — Pie Chart API *(top-5 + "Other", ÷4 corrected)*
-| Column | Format | Description |
-|--------|--------|-------------|
-| `top5_games_by_avg_viewers_json` | `[["Game", avg_viewers], ..., ["Other", avg_viewers]]` | Top-5 games by average viewers; remainder aggregated as "Other" |
-| `top5_games_by_stream_time_json` | `[["Game", hours], ..., ["Other", hours]]` | Top-5 games by hours streamed; remainder aggregated as "Other" |
+### Game Breakdown — Pie Chart API *(all games, ÷4 corrected)*
+| Column | Description |
+|--------|-------------|
+| `games_by_avg_viewers_json` | `[["Game", avg_viewers], ...]` — all games sorted by avg viewers desc |
+| `games_by_stream_time_json` | `[["Game", hours], ...]` — all games sorted by hours streamed desc |
 
-> **÷4 correction applied to both pie columns.** SullyGnome's pie chart API returns values 4× the figures displayed on the website. Both columns are divided by 4 at ingestion time to match the site.
+### Game Breakdown — Games Table API *(full detail per game)*
+| Column | Description |
+|--------|-------------|
+| `all_games_json` | `[["Game", hours_streamed, avg_viewers, peak_viewers, hours_watched], ...]` |
 
----
+### Derived Game Features *(feature-engineered in Phase 3)*
+| Column | Description |
+|--------|-------------|
+| `top_game` | Name of the most-streamed game that month |
+| `top_game_hours` | Hours spent on the top game |
+| `top_game_pct` | % of total stream time on the top game (0–100) |
+| `game_count` | Number of distinct games played |
+| `is_variety_streamer` | `1` if `game_count ≥ 4` AND `top_game_pct < 60%`, else `0` |
 
-### Phase 2 — `twitch_monthly_fact_table_enriched.csv` (24 columns)
-
-All Phase 1 columns plus:
-
-| Column | Format | Description |
-|--------|--------|-------------|
-| `all_games_json` | `[["Game", hours_streamed, avg_viewers, peak_viewers, hours_watched], ...]` | Full game breakdown from the games table API — all games, sorted by hours streamed descending |
-
----
-
-### Phase 3 — `twitch_monthly_fact_table_final.csv` (23 columns)
-
-All Phase 2 columns except `streams` (dropped), with cohort ranks populated:
-
-- `peak_viewer_rank`, `avg_viewer_rank`, `follower_rank`, `follower_gain_rank` — computed per `(year, month)` group; highest value = Rank 1; ties share the top rank; channels with missing data ranked at the bottom.
+> **Note:** `streams` (number of streams) is not available from any SullyGnome API endpoint and is excluded from the final output.
 
 ---
 
 ## Pipeline Architecture
 
 ```
-python main.py --mode full
-       │
-       ├── Phase 1 — IngestionEngine
-       │     Leaderboard API  (5 calls/month × 48 months)
-       │     Pie Chart API ×2 (per channel — top-5, ÷4 corrected)
-       │     → twitch_monthly_fact_table.csv
-       │
-       ├── Phase 2 — EnrichmentEngine
-       │     Games Table API  (per channel, paginated)
-       │     → twitch_monthly_fact_table_enriched.csv
-       │
-       └── Phase 3 — Transformer  (inline, no extra script needed)
-             Cohort ranks · drops 'streams'
-             → twitch_monthly_fact_table_final.csv
+main.py --mode full
+    │
+    ├── Phase 1: IngestionEngine
+    │     Leaderboard API (5 calls/month)
+    │     + Pie Chart API ×2 per channel (all games, ÷4 fixed)
+    │     → twitch_monthly_fact_table.csv
+    │
+    ├── Phase 2: EnrichmentEngine
+    │     Games Table API per channel (paginated, all games)
+    │     → twitch_monthly_fact_table_enriched.csv
+    │
+    └── Phase 3: Transformer (inline, no extra file needed)
+          Cohort ranks + derived game features
+          → twitch_monthly_fact_table_final.csv
 ```
 
 ### Project Structure
 
 ```
 your_project/
-├── main.py                  # Pipeline orchestrator + inline transformer (Phase 3)
+├── main.py                  # Pipeline orchestrator + inline transformer
 ├── requirements.txt
-├── .env                     # Optional — TWITCH_CLIENT_ID + TWITCH_CLIENT_SECRET
+├── .env                     # Optional — Twitch API credentials
 ├── engine/
 │   ├── __init__.py
-│   └── ingestion.py         # IngestionEngine (Phase 1) + EnrichmentEngine (Phase 2)
+│   └── ingestion.py         # All ingestion logic (Phase 1 + Phase 2)
 ├── data/                    # Output CSVs written here (auto-created)
 ├── logs/                    # engine.log written here (auto-created)
 └── checkpoints/             # Resume state (auto-created)
-    ├── processed.txt        # Phase 1 checkpoint — 24,000 entries when complete
-    └── enriched.txt         # Phase 2 checkpoint — 24,000 entries when complete
+    ├── processed.txt        # Phase 1 checkpoint
+    └── enriched.txt         # Phase 2 checkpoint
 ```
 
 ### Engine Components
 
 | Component | Behaviour |
 |-----------|-----------|
-| **RateLimiter** | Token bucket · 429 → 30 s backoff · 5xx / timeout spike → ×0.8 rate · 20-request success streak → +1 rate · capped at 7–14 rps |
-| **CircuitBreaker** | 3× HTTP 403 in 60 s OR 10 consecutive failures → OPEN 5 min → HALF_OPEN probe (10 requests at 1 rps) → CLOSED |
-| **Checkpoint** | Append-only `.txt` file; key = `channelId_year_month`; survives crash or CTRL-C |
-| **CsvWriter** | asyncio-locked file append; writes CSV header once on first run |
-| **HttpClient** | Shared `aiohttp` session; `RETRY_LIMIT=3`; exponential backoff; per-request jitter |
-| **TwitchClient** | Optional Helix API client; in-memory cache across months; auto token refresh on 401 |
+| **RateLimiter** | Token bucket · 429 → 30s backoff · 5xx/timeout spike → ×0.8 rate · 20-request success streak → +1 rate |
+| **CircuitBreaker** | 3× HTTP 403 in 60s OR 10 consecutive failures → OPEN 5 min → HALF_OPEN probe → CLOSED |
+| **Checkpoint** | Append-only `.txt` file; key = `channelId_year_month`; resume-safe across crashes |
+| **CsvWriter** | asyncio-locked file append; writes header once on first run |
+| **HttpClient** | Shared aiohttp session; RETRY_LIMIT=3; exponential backoff; per-request jitter |
+| **TwitchClient** | Optional Helix API client; in-memory cache; auto token refresh |
 
 ---
 
@@ -171,32 +164,29 @@ your_project/
 ```
 GET /api/tables/channeltables/getchannels/{yearmonth}/0/1/3/desc/{start}/100
 ```
-5 calls per month (start = 0, 100, 200, 300, 400) — fetched concurrently → 500 channels.  
-Provides: `channel_id`, `slug`, `display_name`, `followers`, `followers_gained`,
-`average_viewers`, `peak_viewers`, `streamedminutes`, `viewminutes`, `status`, `mature`, `language`, `rank_position`.
+5 calls per month (start = 0, 100, 200, 300, 400) → 500 channels.  
+Provides: `channel_id`, `slug`, `display_name`, `followers`, `followers_gained`, `average_viewers`, `peak_viewers`, `streamedminutes`, `viewminutes`, `status`, `mature`, `language`, `rank_position`.
 
-### 2. Pie Chart APIs (×2 per channel per month)
+### 2. Pie Chart APIs (×2 per channel)
 ```
 GET /api/charts/piecharts/getconfig/channelgamestreamedtime/0/{id}/{slug}/%20/%20/{year}/{month}/%20/0/
 GET /api/charts/piecharts/getconfig/channelgameavgviewers/0/{id}/{slug}/%20/%20/{year}/{month}/%20/0/
 ```
-Returns top-5 games with stream time or average viewers respectively.  
-**÷4 bug fix:** Both pie APIs return values 4× the displayed website figures — corrected in `_extract_pie_stream_time()` and `_extract_pie_avg_viewers()`.
+Returns all games played with stream time / avg viewers.  
+**Bug fix applied:** API returns values 4× the displayed website figures — corrected with `÷ 4` in both extractors.
 
-### 3. Games Table API (per channel per month, paginated)
+### 3. Games Table API (per channel, paginated)
 ```
 GET /api/tables/channeltables/games/{yearmonth}/{channelId}/%20/1/2/desc/{start}/100
 ```
-Returns full per-game breakdown: `streamtime`, `viewtime`, `avgviewers`, `maxviewers`.  
-Paginates automatically (`start += 100`) until `recordsTotal` is reached.  
-Note: `avgviewers` from this endpoint is **not** affected by the ÷4 bug.
+Returns full game breakdown with `streamtime`, `viewtime`, `avgviewers`, `maxviewers` per game.  
+Paginates automatically if a channel played more than 100 games in the month.
 
-### 4. Twitch Helix API (optional, for `created` column)
+### 4. Twitch Helix API (optional)
 ```
 GET https://api.twitch.tv/helix/users?login={slug}
 ```
-Requires `TWITCH_CLIENT_ID` and `TWITCH_CLIENT_SECRET` in `.env`.  
-Results are cached in-memory to avoid duplicate requests across months for the same channel.
+Provides channel `created_at` date. Requires `TWITCH_CLIENT_ID` and `TWITCH_CLIENT_SECRET` in `.env`. Results are cached in-memory to avoid duplicate requests across months.
 
 ---
 
@@ -204,15 +194,12 @@ Results are cached in-memory to avoid duplicate requests across months for the s
 
 | Metric | Value |
 |--------|-------|
-| Total records | 24,000 (48 months × 500 channels) |
-| Total requests — Phase 1 | ~72,000 (5 leaderboard + 2 pie × 24,000 channels) |
-| Total requests — Phase 2 | ~24,000 (1 games API call per channel) |
-| Total requests — full run | ~96,000 |
-| Effective sustained rate | 10.8 – 11 rps |
+| Total requests (full run) | ~96,000 (Phase 1: ~72k · Phase 2: ~24k) |
+| Effective sustained rate | 10.8–11 rps |
 | Concurrency | 12 simultaneous requests |
-| Per-request jitter | 100 – 250 ms |
-| Batch pause | 3 – 5 s every 300 records |
-| Expected runtime — full run | ~2.5 – 3 hours |
+| Expected runtime | ~2.5–3 hours |
+| Batch pause | 3–5s every 300 records |
+| Per-request jitter | 100–250ms |
 
 ---
 
@@ -222,33 +209,15 @@ Results are cached in-memory to avoid duplicate requests across months for the s
 python main.py [OPTIONS]
 
 Options:
-  --mode {full,incremental}
-        full        = fresh run; deletes existing CSVs and checkpoints first
-        incremental = skip already checkpointed records, resume where stopped
-        [default: full]
+  --mode {full,incremental}   full = fresh run (deletes existing output + checkpoints)
+                              incremental = skip already processed records  [default: full]
 
-  --data-dir PATH
-        Directory for all output CSV files
-        [default: data/]
-
-  --checkpoint-dir PATH
-        Directory for checkpoint files (processed.txt, enriched.txt)
-        [default: checkpoints/]
-
-  --years INT [INT ...]
-        Years to process
-        [default: 2022 2023 2024 2025]
-
-  --months MONTH [MONTH ...]
-        Months to process (january … december)
-        [default: all 12]
-
-  --skip-phase2
-        Stop after Phase 1 only — skips games API enrichment and transformer.
-        Produces twitch_monthly_fact_table.csv only.
-
-  --log-level {DEBUG,INFO,WARNING,ERROR}
-        [default: INFO]
+  --data-dir PATH             Directory for output CSVs  [default: data/]
+  --checkpoint-dir PATH       Directory for checkpoint files  [default: checkpoints/]
+  --years INT [INT ...]       Years to process  [default: 2022 2023 2024 2025]
+  --months MONTH [MONTH ...]  Months to process  [default: all 12]
+  --skip-phase2               Stop after Phase 1 only — skip games API and transformer
+  --log-level LEVEL           DEBUG / INFO / WARNING / ERROR  [default: INFO]
 ```
 
 ### Common Commands
@@ -257,19 +226,19 @@ Options:
 # Full run — both deliverables
 python main.py --mode full
 
-# Resume after a crash or interruption
+# Resume after a crash
 python main.py --mode incremental
 
-# Phase 1 only (no games API — roughly half the runtime)
+# Phase 1 only (faster — skips games API)
 python main.py --mode full --skip-phase2
 
-# Specific years only
+# Specific years
 python main.py --mode full --years 2024 2025
 
-# Single month test run
+# Single month test
 python main.py --mode full --years 2022 --months january
 
-# Verbose debug output
+# Debug logging
 python main.py --mode full --log-level DEBUG
 ```
 
@@ -278,10 +247,10 @@ python main.py --mode full --log-level DEBUG
 ## Safety Features
 
 - **Single residential IP** — no proxy rotation, no IP switching
-- **No Selenium or headless browsers** — pure async HTTP only
+- **No Selenium or headless browsers** — pure HTTP API calls only
 - **No header spoofing** — standard Chrome User-Agent
-- **Adaptive rate limiter** — stays within 7–14 rps; backs off on errors, recovers on sustained success
-- **Circuit breaker** — stops on repeated 403s or consecutive failures to protect the IP
-- **Per-request jitter** — 100–250 ms random delay on every request
-- **Batch sleep** — 3–5 s pause every 300 records
-- **Two independent checkpoints** — Phase 1 and Phase 2 each have their own checkpoint file; `--mode incremental` can resume either phase independently
+- **Adaptive rate limiter** — stays between 7–14 rps; backs off on errors, recovers on success
+- **Circuit breaker** — halts on repeated 403s or consecutive failures; prevents IP bans
+- **Per-request jitter** — 100–250ms random delay on every request
+- **Batch sleep** — 3–5s pause every 300 records
+- **Resume safe** — two independent checkpoints survive crash or CTRL-C; `--mode incremental` picks up exactly where it stopped

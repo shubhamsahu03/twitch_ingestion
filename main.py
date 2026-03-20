@@ -4,7 +4,7 @@ Twitch Analytics Pipeline — Single-Run Orchestrator
 
 Runs three phases sequentially and produces two deliverable files:
 
-  Phase 1  →  twitch_monthly_fact_table.csv          (leaderboard + top-5 pie, ÷4 fixed)
+  Phase 1  →  twitch_monthly_fact_table.csv          (leaderboard + all-games pie, ÷4 fixed)
   Phase 2  →  twitch_monthly_fact_table_enriched.csv  (+ all_games_json from games table API)
   Transform→  twitch_monthly_fact_table_final.csv     (+ cohort ranks, clean column order)
 
@@ -61,19 +61,19 @@ logger = logging.getLogger("twitch_engine.main")
 # ─────────────────────────────────────────────
 def run_transformer(enriched_csv: Path, final_csv: Path) -> None:
     """
-    Phase 3 — Feature Engineering (Cohort Ranking).
+    Phase 3 — Feature Engineering (Cohort Ranking + Derived Columns).
 
-    Reads the Phase 2 enriched CSV, computes per-month cohort ranks for
-    avg_viewers, peak_viewers, followers, and followers_gained, then writes
-    the final clean CSV.
+    Reads the Phase 2 enriched CSV and produces the final analytics-ready CSV with:
 
-    Key fixes vs. the old transformer.py:
-      • pd.to_numeric() coercion before groupby-rank prevents silent NaN ranks
-        when a value is an empty string (which would previously produce rank 0
-        for ALL rows in that cohort).
-      • na_option='bottom' sends channels with missing data to the bottom of the
-        rank instead of floating to an arbitrary position.
-      • ascending=False is explicit: highest metric value = Rank 1.
+    1. Cohort ranks (per year+month group):
+         avg_viewer_rank, peak_viewer_rank, follower_rank, follower_gain_rank
+
+    2. Game-derived feature columns (computed from games_by_stream_time_json):
+         top_game               — name of the most-streamed game that month
+         top_game_hours         — hours spent on that game
+         top_game_pct           — % of total stream time on that game  (0–100)
+         game_count             — number of distinct games played
+         is_variety_streamer    — 1 if game_count >= 4 AND top_game_pct < 60%
     """
     try:
         import pandas as pd
@@ -81,7 +81,7 @@ def run_transformer(enriched_csv: Path, final_csv: Path) -> None:
         logger.error("pandas not installed — run: pip install pandas")
         raise
 
-    logger.info("═══ [Phase 3] Transformer — Cohort Ranking ═══")
+    logger.info("═══ [Phase 3] Transformer — Cohort Ranking + Feature Engineering ═══")
     logger.info("Input : %s", enriched_csv)
     logger.info("Output: %s", final_csv)
 
@@ -98,9 +98,7 @@ def run_transformer(enriched_csv: Path, final_csv: Path) -> None:
         df.drop(columns=["streams"], inplace=True)
         logger.info("Dropped 'streams' column (unavailable from API).")
 
-    # ── Cohort rank calculation ──────────────────────────────────────────────
-    # Ranks are scoped per (year, month) so each month's Top 500 cohort gets
-    # independent ranks from 1 to 500.
+    # ── 1. Cohort rank calculation ───────────────────────────────────────────
     rank_mappings = {
         "average_viewers":  "avg_viewer_rank",
         "peak_viewers":     "peak_viewer_rank",
@@ -112,21 +110,53 @@ def run_transformer(enriched_csv: Path, final_csv: Path) -> None:
         if metric_col not in df.columns:
             logger.warning("Missing column '%s' — skipping %s", metric_col, rank_col)
             continue
-
-        # Coerce to numeric — empty strings / non-numeric values become NaN
         df[metric_col] = pd.to_numeric(df[metric_col], errors="coerce")
-
         df[rank_col] = (
             df.groupby(["year", "month"])[metric_col]
-            .rank(
-                method="min",       # ties share the best rank  e.g. 1,2,2,4
-                ascending=False,    # highest value = Rank 1
-                na_option="bottom", # channels with NaN go to the bottom of cohort
-            )
-            .fillna(0)
-            .astype(int)
+            .rank(method="min", ascending=False, na_option="bottom")
+            .fillna(0).astype(int)
         )
         logger.info("  ✓ %s  (highest %s = Rank 1)", rank_col, metric_col)
+
+    # ── 2. Game-derived feature columns ─────────────────────────────────────
+    # Derived from games_by_stream_time_json:
+    #   [["GameName", hours], ...]  sorted descending by hours (index 0 = most streamed)
+    import json as _json
+
+    def _parse_top_game(raw: str) -> tuple:
+        """Returns (top_game_name, top_game_hours, game_count)."""
+        try:
+            games = _json.loads(raw) if raw and raw != "[]" else []
+            if not games:
+                return ("", 0.0, 0)
+            return (games[0][0], float(games[0][1]), len(games))
+        except Exception:
+            return ("", 0.0, 0)
+
+    parsed = df["games_by_stream_time_json"].apply(_parse_top_game)
+
+    df["top_game"]       = parsed.apply(lambda x: x[0])
+    df["top_game_hours"] = parsed.apply(lambda x: round(x[1], 2))
+    df["game_count"]     = parsed.apply(lambda x: x[2])
+
+    # top_game_pct: what % of total stream time was spent on the top game
+    hours_streamed = pd.to_numeric(df["hours_streamed"], errors="coerce").fillna(0)
+    df["top_game_pct"] = (
+        df["top_game_hours"]
+        .div(hours_streamed.replace(0, float("nan")))
+        .mul(100)
+        .round(1)
+        .fillna(0.0)
+    )
+
+    # is_variety_streamer: 1 if played ≥4 games AND no single game >60% of stream time
+    df["is_variety_streamer"] = (
+        (df["game_count"] >= 4) & (df["top_game_pct"] < 60.0)
+    ).astype(int)
+
+    logger.info(
+        "  ✓ top_game, top_game_hours, top_game_pct, game_count, is_variety_streamer"
+    )
 
     # Handle missing creation dates
     if "created" in df.columns:
@@ -137,14 +167,24 @@ def run_transformer(enriched_csv: Path, final_csv: Path) -> None:
 
     # ── Final column order ───────────────────────────────────────────────────
     final_columns = [
+        # Identity
         "year", "month", "channel_id", "channel_slug", "display_name",
-        "rank_position", "followers", "followers_gained", "average_viewers", "peak_viewers",
-        "hours_streamed", "hours_watched", "status", "mature", "language", "created",
+        # Performance
+        "rank_position", "followers", "followers_gained",
+        "average_viewers", "peak_viewers",
+        "hours_streamed", "hours_watched",
+        # Channel metadata
+        "status", "mature", "language", "created",
+        # Cohort ranks
         "peak_viewer_rank", "avg_viewer_rank", "follower_rank", "follower_gain_rank",
-        "top5_games_by_avg_viewers_json", "top5_games_by_stream_time_json",
+        # Game breakdown — pie charts (all games, ÷4 corrected)
+        "games_by_avg_viewers_json", "games_by_stream_time_json",
+        # Game breakdown — table API (all games, full detail)
         "all_games_json",
+        # Derived game features
+        "top_game", "top_game_hours", "top_game_pct",
+        "game_count", "is_variety_streamer",
     ]
-    # Keep only columns that actually exist (graceful if a column is missing)
     final_columns = [c for c in final_columns if c in df.columns]
 
     final_csv.parent.mkdir(parents=True, exist_ok=True)
@@ -163,7 +203,7 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Output files (all written under --data-dir):
-  twitch_monthly_fact_table.csv          Phase 1: leaderboard + top-5 pie (÷4 fixed)
+  twitch_monthly_fact_table.csv          Phase 1: leaderboard + all-games pie (÷4 fixed)
   twitch_monthly_fact_table_enriched.csv Phase 2: + all_games_json from games table API
   twitch_monthly_fact_table_final.csv    Phase 3: + cohort ranks (transformer)
 
@@ -270,10 +310,10 @@ async def main() -> None:
     pipeline_start = time.time()
 
     # ════════════════════════════════════════════════════════════════════════
-    #  PHASE 1 — Leaderboard + Pie Top-5  → twitch_monthly_fact_table.csv
+    #  PHASE 1 — Leaderboard + All-Games Pie  → twitch_monthly_fact_table.csv
     # ════════════════════════════════════════════════════════════════════════
     logger.info("")
-    logger.info("▶ Starting Phase 1: Leaderboard + Pie Top-5 ingestion")
+    logger.info("▶ Starting Phase 1: Leaderboard + All-Games Pie ingestion")
     p1_engine = IngestionEngine(
         output_path=p1_csv,
         checkpoint_path=p1_checkpoint,

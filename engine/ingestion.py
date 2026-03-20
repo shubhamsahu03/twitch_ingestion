@@ -2,7 +2,7 @@
 Twitch Analytics Ingestion Engine
 Fully Deterministic · API-First (JSON Only) · Adaptive · Residential-Safe
 
-Phase 1 — IngestionEngine  : Leaderboard + Pie Top-5 (÷4 fix) → twitch_monthly_fact_table.csv
+Phase 1 — IngestionEngine  : Leaderboard + Pie All-Games (÷4 fixed) → twitch_monthly_fact_table.csv
 Phase 2 — EnrichmentEngine : Games Table API (all games, paginated) → twitch_monthly_fact_table_enriched.csv
 """
 
@@ -48,7 +48,7 @@ LEADERBOARD_URL = (
     + "/api/tables/channeltables/getchannels/{yearmonth}/0/1/3/desc/{start}/100"
 )
 
-# Pie chart APIs (top-5 per channel per month)
+# Pie chart APIs — all games per channel per month (÷4 corrected, sorted descending)
 PIE_STREAM_TIME_URL = (
     BASE_URL
     + "/api/charts/piecharts/getconfig/channelgamestreamedtime"
@@ -76,14 +76,14 @@ MONTHS = [
 # ─────────────────────────────────────────────
 #  SCHEMAS
 # ─────────────────────────────────────────────
-# File 1 — leaderboard metadata + top-5 pie data (÷4 fixed)
+# File 1 — leaderboard metadata + complete pie data (÷4 fixed, all games)
 PHASE1_SCHEMA = [
     "year", "month", "channel_id", "channel_slug", "display_name",
     "rank_position", "followers", "followers_gained", "average_viewers",
     "peak_viewers", "hours_streamed", "hours_watched", "streams",
     "status", "mature", "language", "created",
     "peak_viewer_rank", "avg_viewer_rank", "follower_rank", "follower_gain_rank",
-    "top5_games_by_avg_viewers_json", "top5_games_by_stream_time_json",
+    "games_by_avg_viewers_json", "games_by_stream_time_json",
 ]
 
 # File 2 — Phase 1 columns + full games breakdown from games table API
@@ -438,53 +438,52 @@ class CsvWriter:
 # ─────────────────────────────────────────────
 def _extract_pie_stream_time(data: Optional[dict]) -> str:
     """
-    Parse channelgamestreamedtime pie API response.
-    Values are hours streamed per game — stored as-is, no correction needed.
-    Output: [["GameName", hours], ..., ["Other", hours]]  top-5 + remainder
+    Parse channelgamestreamedtime pie API response → ALL games, sorted by hours desc.
+
+    BUG FIX (÷4): Same as avg_viewers — the stream-time pie API also returns values
+    4× too high. Confirmed by cross-referencing sum(game hours) vs leaderboard
+    hours_streamed: ratio was consistently ~4.0 across all 24,000 rows.
+
+    Output: [["GameName", hours], ...]  — ALL games, no cap, no "Other" bucket.
     """
     if not data:
         return "[]"
     try:
         labels: list[str]   = data["data"]["labels"]
         values: list[float] = data["data"]["datasets"][0]["data"]
-        pairs = sorted([(g, v / 4) for g, v in zip(labels, values)],key=lambda x: x[1],reverse=True,)
-        top5  = pairs[:5]
-        rest  = sum(v for _, v in pairs[5:])
-        result: list[list] = [[g, round(v, 2)] for g, v in top5]
-        if rest:
-            result.append(["Other", round(rest, 2)])
-        return json.dumps(result)
+        # ÷4 correction — same root cause as avg_viewers pie
+        pairs = sorted(
+            [(g, v / 4) for g, v in zip(labels, values)],
+            key=lambda x: x[1],
+            reverse=True,
+        )
+        return json.dumps([[g, round(v, 2)] for g, v in pairs])
     except (KeyError, IndexError, TypeError):
         return "[]"
 
 
 def _extract_pie_avg_viewers(data: Optional[dict]) -> str:
     """
-    Parse channelgameavgviewers pie API response.
+    Parse channelgameavgviewers pie API response → ALL games, sorted by avg viewers desc.
 
     BUG FIX (÷4): The SullyGnome pie API returns average viewer values that are
-    4x the figure displayed on the website. Confirmed by cross-referencing the
-    API output against multiple rendered channel-month pages. The ÷4 correction
-    is applied ONLY here — the stream-time pie and the games table API are unaffected.
+    4× the figure displayed on the website. Confirmed by cross-referencing the
+    API output against multiple rendered channel-month pages.
 
-    Output: [["GameName", avg_viewers], ..., ["Other", avg_viewers]]  top-5 + remainder
+    Output: [["GameName", avg_viewers], ...]  — ALL games, no cap, no "Other" bucket.
     """
     if not data:
         return "[]"
     try:
         labels: list[str]   = data["data"]["labels"]
         values: list[float] = data["data"]["datasets"][0]["data"]
+        # ÷4 correction — returns correct avg viewer figures matching the website
         pairs = sorted(
             [(g, v / 4) for g, v in zip(labels, values)],
             key=lambda x: x[1],
             reverse=True,
         )
-        top5  = pairs[:5]
-        rest  = sum(v for _, v in pairs[5:])
-        result: list[list] = [[g, round(v, 2)] for g, v in top5]
-        if rest:
-            result.append(["Other", round(rest, 2)])
-        return json.dumps(result)
+        return json.dumps([[g, round(v, 2)] for g, v in pairs])
     except (KeyError, IndexError, TypeError):
         return "[]"
 
@@ -554,7 +553,7 @@ async def fetch_pie(
     month_num: int,
     pie_type: str,
 ) -> str:
-    """Fetch one pie chart and return parsed top-5 JSON."""
+    """Fetch one pie chart and return all-games JSON (÷4 corrected, sorted descending)."""
     if pie_type == "stream_time":
         url  = PIE_STREAM_TIME_URL.format(
             channel_id=channel_id, slug=slug, year=year, month=month_num
@@ -613,7 +612,7 @@ async def build_phase1_record(
     month_name: str,
     month_num: int,
 ) -> Optional[dict]:
-    """Build one Phase 1 row: leaderboard metadata + top-5 pie charts."""
+    """Build one Phase 1 row: leaderboard metadata + all-games pie charts (÷4 fixed)."""
     channel_id: int  = channel.get("id") or channel.get("channelId", 0)
     slug: str        = (channel.get("url") or channel.get("channelurl") or "").strip("/").split("/")[-1]
     display_name: str = channel.get("displayname") or channel.get("channelname", "")
@@ -657,8 +656,8 @@ async def build_phase1_record(
         "avg_viewer_rank":                "",
         "follower_rank":                  "",
         "follower_gain_rank":             "",
-        "top5_games_by_avg_viewers_json": pie_av,
-        "top5_games_by_stream_time_json": pie_st,
+        "games_by_avg_viewers_json":       pie_av,
+        "games_by_stream_time_json":       pie_st,
     }
 
 
@@ -667,7 +666,7 @@ async def build_phase1_record(
 # ─────────────────────────────────────────────
 class IngestionEngine:
     """
-    Phase 1: Leaderboard API + Pie Top-5 (÷4 fixed) → PHASE1_SCHEMA CSV.
+    Phase 1: Leaderboard API + All-Games Pie Charts (÷4 fixed) → PHASE1_SCHEMA CSV.
     Output: twitch_monthly_fact_table.csv
     """
 
