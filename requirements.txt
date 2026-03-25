@@ -3,4 +3,5 @@ beautifulsoup4==4.12.3
 lxml==5.2.1
 pandas>=2.0.0
 python-dotenv
- 
+pyarrow>=14.0
+redis[asyncio]>=5.0
