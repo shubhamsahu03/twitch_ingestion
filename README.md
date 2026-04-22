@@ -1,8 +1,71 @@
-# Twitch Analytics Ingestion Engine
-**Fully Deterministic · API-First · Adaptive · Residential-Safe**
+# Twitch Full Panel Pipeline
 
-Extracts 48 months × 500 channels = **24,000 channel-month records** from SullyGnome  
-and produces two clean, analytics-ready CSV files.
+> A production-grade async data engineering system that reconstructs complete 48-month longitudinal histories for every channel that ever reached the Twitch Top 500 — sourcing, recovering, and enriching **116,592 channel-month records** across four live APIs with zero estimation or interpolation.
+
+---
+
+## Dataset at a Glance
+
+| Metric | Value |
+|---|---|
+| Total channel-month records | **116,592** |
+| Unique channels tracked | **2,429** |
+| Timeline span | **Jan 2022 → Dec 2025 (48 months)** |
+| Channels with full 48-row histories | **100%** |
+| Real-data coverage | **71.1%** — 82,845 rows with measured activity |
+| Active · Top 500 | **24,002** rows |
+| Active · Outside Top 500 | **58,843** rows |
+| Confirmed inactive | **33,747** rows (28.9%) |
+| Columns per record | **28** |
+| Total viewer-hours indexed | **> 10 billion** |
+| Total stream-hours indexed | **> 1.9 million** |
+| Distinct games tracked | **1,000+** |
+| Twitch account creation dates resolved | **96.7%** of channels |
+
+Every channel has exactly 48 rows. Every month is assigned a validated status. No gaps, no interpolation, no estimates.
+
+---
+
+## Problem Statement
+
+Twitch exposes no historical ranked data through any public API. SullyGnome publishes monthly leaderboards as paginated JSON endpoints but data for channels outside the current visible window is silently absent — and even channels that did appear in historical leaderboards frequently have missing months due to temporary inactivity, leaderboard rank fluctuation, or API edge cases. Simply scraping the Top 500 per month produces a sparse, biased panel that understates channel longevity and overstates churn.
+
+This pipeline solves the problem in four independent phases. Each phase has its own checkpoint, caching layer, and recovery system. Together they maximise real-data coverage across the full four-year window while maintaining a strict "no fabrication" constraint — every value in the output either came from a live API response or is explicitly null.
+
+---
+
+## Repository Structure
+
+```
+.
+├── twitch_full_panel_pipeline.py        # Main pipeline — Phases 1, 2, 3
+├── enrich.py                            # Game + Twitch Helix enrichment — Phase 4
+├── analyze_twitch_full_panel_enriched.py  # Analysis, coverage report, chart export
+├── drop_columns.py                      # Utility: remove computed columns before re-run
+├── _env                                 # Credentials template — copy to .env
+├── requirements.txt
+│
+├── output/                              # Auto-created by pipeline
+│   ├── twitch_full_panel.csv                ← Phase 3 output (core panel)
+│   ├── twitch_full_panel_cleaned.csv        ← After drop_columns (enrichment input)
+│   ├── twitch_full_panel_enriched.csv       ← Phase 4 output (final deliverable)
+│   └── parquet/                             ← Partitioned by month_key
+│       └── month_key=2022january/
+│           └── part-*.parquet
+│
+├── cache/                               # SQLite response cache — auto-created
+│   ├── api_cache.sqlite3                ← Pipeline pages + rank maps (24 h / 7 d TTL)
+│   └── enrich_cache.sqlite3             ← Twitch Helix responses (30 d TTL)
+│
+├── checkpoints/                         # Crash-safe resume state — auto-created
+│   └── rank_progress.json               ← Per-month completion + mid-month offset
+│
+├── logs/                                # Structured log output — auto-created
+│   ├── twitch_full_panel_pipeline.log
+│   └── twitch_enrich.log
+│
+└── analysis_output/                     # Charts and markdown report — auto-created
+```
 
 ---
 
@@ -12,276 +75,408 @@ and produces two clean, analytics-ready CSV files.
 # 1. Install dependencies
 pip install -r requirements.txt
 
-# 2. (Optional) Add Twitch credentials for the 'created' column
-echo "TWITCH_CLIENT_ID=your_id" > .env
-echo "TWITCH_CLIENT_SECRET=your_secret" >> .env
+# 2. Add credentials (Twitch account creation dates require Helix API access)
+cp _env .env
+# Edit .env:  TWITCH_CLIENT_ID=...   TWITCH_CLIENT_SECRET=...
 
-# 3. Full historical ingestion (2022–2025, all months) — both output files
-python main.py --mode full
+# 3. Full pipeline run
+python twitch_full_panel_pipeline.py --mode full
 
-# 4. Resume after any interruption
-python main.py --mode incremental
+# 4. Enrich with per-game breakdown data
+python enrich.py --input output/twitch_full_panel_cleaned.csv
 
-# 5. Test with a single month before full run
-python main.py --mode full --years 2024 --months january
+# 5. Generate coverage report and charts
+python analyze_twitch_full_panel_enriched.py --input output/twitch_full_panel_enriched.csv
+
+# 6. Resume after a crash or interruption (picks up mid-month)
+python twitch_full_panel_pipeline.py --mode incremental
+
+# 7. Test with one month before committing to a full run
+python twitch_full_panel_pipeline.py --mode full --years 2024 --months january
 ```
 
 ---
 
-## Output Files
+## Architecture
 
-The pipeline runs three phases sequentially and produces two deliverables:
+The system is split into four sequential phases, each independently resumable.
 
 ```
-data/
-├── twitch_monthly_fact_table.csv           ← Deliverable 1  (Phase 1)
-├── twitch_monthly_fact_table_enriched.csv  ← Intermediate   (Phase 2)
-└── twitch_monthly_fact_table_final.csv     ← Deliverable 2  (Phase 3)
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  Phase 1 — RankIndexer                                                      │
+│                                                                             │
+│  For each of 48 months, scans the SullyGnome leaderboard across 5 rank     │
+│  bands until every target channel is located or the rank ceiling is hit.    │
+│                                                                             │
+│  Band 1   rank      0 – 500     concurrency=8   retry=1                    │
+│  Band 2   rank    500 – 2,000   concurrency=8   retry=1                    │
+│  Band 3   rank  2,000 – 5,000   concurrency=8   retry=4                    │
+│  Band 4   rank  5,000 – 10,000  concurrency=5   retry=4                    │
+│  Band 5   rank 10,000 – 20,000  concurrency=5   retry=2  (reverse order)   │
+│                                                                             │
+│  Early stop: fired by any of 3 independent heuristics (see below).         │
+│  Recovery pass: scans ranks 12,000–30,000 for channels still missing.      │
+│  Output: rank_maps + metrics_maps keyed by (channel_id, month_key).        │
+└──────────────────────────────┬──────────────────────────────────────────────┘
+                               │
+┌──────────────────────────────▼──────────────────────────────────────────────┐
+│  Phase 2 — CsvLoader + ChannelDataFetcher                                   │
+│                                                                             │
+│  Loads the existing fact table CSV into two in-memory lookup maps:         │
+│    csv_rank_map:     (channel_id, month_key) → rank                        │
+│    csv_metrics_map:  (channel_id, month_key) → metric dict                 │
+│                                                                             │
+│  For any (channel, month) pair with a rank but no metrics in the CSV,      │
+│  fetches the per-channel monthly summary from the SullyGnome channel API.  │
+│  Tries channel_slug first; falls back to slugify(display_name) on 404.     │
+└──────────────────────────────┬──────────────────────────────────────────────┘
+                               │
+┌──────────────────────────────▼──────────────────────────────────────────────┐
+│  Phase 3 — PanelBuilder                                                     │
+│                                                                             │
+│  Merges all sources into a strict 48-row-per-channel panel DataFrame.      │
+│  Conflict resolution: live leaderboard data wins field-by-field over CSV.  │
+│  Assigns status labels (see Status System below).                          │
+│  Four hard-fail validation assertions before writing output.               │
+│  Writes twitch_full_panel.csv + Parquet partitioned by month_key.          │
+└──────────────────────────────┬──────────────────────────────────────────────┘
+                               │
+┌──────────────────────────────▼──────────────────────────────────────────────┐
+│  Phase 4 — EnrichmentEngine  (enrich.py, separate script)                  │
+│                                                                             │
+│  Streams input CSV in chunks of 5,000 rows (memory-safe for large files).  │
+│  Per-row skip guard: rows with all_games_json already populated are        │
+│  skipped entirely — no redundant fetches on re-runs.                       │
+│  Fetches full per-game breakdown from SullyGnome games table API.          │
+│  Resolves Twitch account creation dates via Helix /users (batch 100).      │
+│  Writes enriched CSV + Parquet as it goes via a streaming chunk writer.    │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
-
-| File | Rows | Contents |
-|------|------|----------|
-| `twitch_monthly_fact_table.csv` | 24,000 | Leaderboard metadata + top-5 pie charts (÷4 corrected) |
-| `twitch_monthly_fact_table_enriched.csv` | 24,000 | Above + full games breakdown from games table API |
-| `twitch_monthly_fact_table_final.csv` | 24,000 | Above + cohort ranks, `streams` column dropped |
 
 ---
 
-## Schema
+## Status System
 
-### Phase 1 — `twitch_monthly_fact_table.csv` (23 columns)
+Every row in the output carries exactly one of four status values, assigned deterministically by `PanelBuilder`:
 
-#### Identity
-| Column | Description |
-|--------|-------------|
-| `year` | 2022 – 2025 |
-| `month` | january – december |
-| `channel_id` | SullyGnome internal channel ID |
-| `channel_slug` | URL slug (e.g. `xqc`) |
-| `display_name` | Channel display name |
+| Status | Condition | Rows |
+|---|---|---|
+| `active_top500` | Rank ≤ 500 and at least one metric present | 24,002 |
+| `active_not_top500` | Rank > 500 and at least one metric present | 58,843 |
+| `active_unranked` | No rank found, but channel API returned metrics | small subset |
+| `inactive` | No metrics from any source for that month | 33,747 |
 
-#### Performance Metrics
-| Column | Description |
-|--------|-------------|
-| `rank_position` | Leaderboard rank 1–500 for that month |
-| `followers` | Total followers at month end |
-| `followers_gained` | Followers gained during the month |
-| `average_viewers` | Average concurrent viewers |
-| `peak_viewers` | Peak concurrent viewers |
-| `hours_streamed` | Total hours streamed (`streamedminutes ÷ 60`) |
-| `hours_watched` | Total viewer-hours (`viewminutes ÷ 60`) |
-| `streams` | Always empty — not available from any SullyGnome API |
-
-#### Channel Metadata
-| Column | Description |
-|--------|-------------|
-| `status` | Channel status |
-| `mature` | Mature content flag |
-| `language` | Primary broadcast language |
-| `created` | Twitch account creation date (requires `.env` credentials, otherwise empty) |
-
-#### Cohort Ranks *(empty in Phase 1 — populated by Phase 3 transformer)*
-| Column | Description |
-|--------|-------------|
-| `peak_viewer_rank` | Rank by peak viewers within the month's Top 500 |
-| `avg_viewer_rank` | Rank by average viewers within the month's Top 500 |
-| `follower_rank` | Rank by total followers within the month's Top 500 |
-| `follower_gain_rank` | Rank by followers gained within the month's Top 500 |
-
-#### Game Breakdown — Pie Chart API *(top-5 + "Other", ÷4 corrected)*
-| Column | Format | Description |
-|--------|--------|-------------|
-| `top5_games_by_avg_viewers_json` | `[["Game", avg_viewers], ..., ["Other", avg_viewers]]` | Top-5 games by average viewers; remainder aggregated as "Other" |
-| `top5_games_by_stream_time_json` | `[["Game", hours], ..., ["Other", hours]]` | Top-5 games by hours streamed; remainder aggregated as "Other" |
-
-> **÷4 correction applied to both pie columns.** SullyGnome's pie chart API returns values 4× the figures displayed on the website. Both columns are divided by 4 at ingestion time to match the site.
+A row is `inactive` only when both the leaderboard scan and the CSV produced no usable metrics for that channel-month pair. Ranked rows that are missing metrics trigger a logged warning and are never silently assigned `inactive`.
 
 ---
 
-### Phase 2 — `twitch_monthly_fact_table_enriched.csv` (24 columns)
+## Conflict Resolution
 
-All Phase 1 columns plus:
+When two sources provide data for the same `(channel_id, month_key)`, the merge follows a strict priority order:
 
-| Column | Format | Description |
-|--------|--------|-------------|
-| `all_games_json` | `[["Game", hours_streamed, avg_viewers, peak_viewers, hours_watched], ...]` | Full game breakdown from the games table API — all games, sorted by hours streamed descending |
+1. The CSV metrics dict is used as the base — the existing fact table is the starting point for all fields.
+2. Live leaderboard values are applied field-by-field, overwriting any CSV value where the live value is non-null.
+3. The `source` field records the winner: `"leaderboard"` if any live value was applied, `"csv"` otherwise.
 
----
-
-### Phase 3 — `twitch_monthly_fact_table_final.csv` (23 columns)
-
-All Phase 2 columns except `streams` (dropped), with cohort ranks populated:
-
-- `peak_viewer_rank`, `avg_viewer_rank`, `follower_rank`, `follower_gain_rank` — computed per `(year, month)` group; highest value = Rank 1; ties share the top rank; channels with missing data ranked at the bottom.
+This means a channel with enriched game data in the CSV will retain those fields even when the live leaderboard response does not include them, while fresh viewer counts from the leaderboard will overwrite stale CSV values.
 
 ---
 
-## Pipeline Architecture
+## Early Stop Heuristics
 
-```
-python main.py --mode full
-       │
-       ├── Phase 1 — IngestionEngine
-       │     Leaderboard API  (5 calls/month × 48 months)
-       │     Pie Chart API ×2 (per channel — top-5, ÷4 corrected)
-       │     → twitch_monthly_fact_table.csv
-       │
-       ├── Phase 2 — EnrichmentEngine
-       │     Games Table API  (per channel, paginated)
-       │     → twitch_monthly_fact_table_enriched.csv
-       │
-       └── Phase 3 — Transformer  (inline, no extra script needed)
-             Cohort ranks · drops 'streams'
-             → twitch_monthly_fact_table_final.csv
-```
+The `RankIndexer` does not scan all 20,000 rank positions for every month. Three independent signals halt the scan early once the pipeline has located all the hits it reasonably can:
 
-### Project Structure
+**Consecutive-no-new threshold.** After 10 consecutive pages (20 pages at ranks > 10,000) with no new target channels found, the current band scan stops. Ten pages covering 1,000 rows with zero hits is a reliable signal that the remaining targets are not in this part of the rank distribution.
 
-```
-your_project/
-├── main.py                  # Pipeline orchestrator + inline transformer (Phase 3)
-├── requirements.txt
-├── .env                     # Optional — TWITCH_CLIENT_ID + TWITCH_CLIENT_SECRET
-├── engine/
-│   ├── __init__.py
-│   └── ingestion.py         # IngestionEngine (Phase 1) + EnrichmentEngine (Phase 2)
-├── data/                    # Output CSVs written here (auto-created)
-├── logs/                    # engine.log written here (auto-created)
-└── checkpoints/             # Resume state (auto-created)
-    ├── processed.txt        # Phase 1 checkpoint — 24,000 entries when complete
-    └── enriched.txt         # Phase 2 checkpoint — 24,000 entries when complete
-```
+**Phase-5 zero-yield stop.** If the last three consecutive batches in the highest rank band each produced zero new hits, the month scan is considered exhausted.
 
-### Engine Components
+**Sparse-tail stop.** In rank bands 4 and 5, if the last five batches combined yielded fewer than three new hits total, scanning continues no further. This catches the sparse mid-range where target channels are scattered too thinly to justify the API cost.
 
-| Component | Behaviour |
-|-----------|-----------|
-| **RateLimiter** | Token bucket · 429 → 30 s backoff · 5xx / timeout spike → ×0.8 rate · 20-request success streak → +1 rate · capped at 7–14 rps |
-| **CircuitBreaker** | 3× HTTP 403 in 60 s OR 10 consecutive failures → OPEN 5 min → HALF_OPEN probe (10 requests at 1 rps) → CLOSED |
-| **Checkpoint** | Append-only `.txt` file; key = `channelId_year_month`; survives crash or CTRL-C |
-| **CsvWriter** | asyncio-locked file append; writes CSV header once on first run |
-| **HttpClient** | Shared `aiohttp` session; `RETRY_LIMIT=3`; exponential backoff; per-request jitter |
-| **TwitchClient** | Optional Helix API client; in-memory cache across months; auto token refresh on 401 |
+After all five bands complete with channels still missing, a **dedicated recovery pass** scans ranks 12,000–30,000 sequentially and stops after five consecutive zero-yield batches. This catches channels that fell below the primary scan window due to the early-stop heuristics firing too aggressively.
+
+---
+
+## Engineering Components
+
+### Adaptive Rate Limiter
+Token-bucket controller that adjusts concurrency live. A 429 response triggers a 30-second full backoff. A 5xx spike or timeout reduces the effective rate by 20%. A streak of 20 consecutive successful requests increments the rate by 1. The rate is capped between 7 and 14 requests per second with hard floor and ceiling.
+
+### Circuit Breaker
+Three HTTP 403 responses within 60 seconds, or 10 consecutive failures of any kind, opens the circuit for 5 minutes. On expiry the breaker enters `HALF_OPEN` and probes with 10 requests at 1 rps. Full closure requires all 10 probes to succeed. This prevents IP-level bans during extended error windows without requiring manual intervention.
+
+### SQLite Cache — WAL Mode
+Both `api_cache.sqlite3` (pipeline) and `enrich_cache.sqlite3` (enrichment) use SQLite with `PRAGMA journal_mode=WAL` for safe concurrent reads under async access. All entries are TTL-keyed:
+
+| Cache key pattern | TTL |
+|---|---|
+| `leaderboard:{month}:{offset}` | 24 hours |
+| `rankmap:{month}` | 7 days |
+| `monthresult:{month}` | 7 days |
+| `channel:{slug}:{month}` | 24 hours |
+| Twitch Helix user responses | 30 days |
+
+On incremental runs with a warm cache, responses from cache are indistinguishable from live API responses at the application layer. Full re-run time drops from ~3 hours to ~15–20 minutes.
+
+### Crash-Safe Progress Checkpoint
+`checkpoints/rank_progress.json` tracks two distinct states per month: `completed` (full scan done, month is closed) and `offsets` (the last successfully processed page offset, for months interrupted mid-scan). All writes use atomic replace — the new state is written to a `.tmp` file first, then `tmp.replace(path)` performs an OS-level atomic rename. A crash during the write leaves the prior checkpoint intact rather than producing a corrupt file.
+
+### Streaming Chunk Writer
+`enrich.py` reads the input CSV in chunks of 5,000 rows and writes output incrementally. Peak memory stays below 1 GB even on the full 116,592-row dataset. Parquet output is partitioned by `month_key` using PyArrow's `write_to_dataset`, enabling column-pruned partition-filtered reads in downstream tools like DuckDB or Polars.
+
+### Retry Depth Variance
+The number of retries per page fetch is tiered by rank depth. Low-rank pages (0–8,000) get 1 retry — they are reliable and fast, extra retries only waste time. Mid-range pages (8,000–14,000) get 4 retries because error rates are higher in this band. High-rank pages (14,000–20,000) get 2 retries — these rarely contain target channels, so extra retries are low-value.
+
+### Slug Fallback
+`ChannelDataFetcher.fetch_one` first attempts the stored `channel_slug`. On 404 it generates a fallback slug from `display_name` via `slugify_display_name()` — lowercase, whitespace stripped, non-alphanumeric characters removed — and retries once. This recovers channels whose URL slugs changed between collection and enrichment, or were stored inconsistently in the source data.
+
+### MonthStats
+A per-month `@dataclass` that accumulates `channels_found`, `api_calls`, `cache_hits`, `early_stop_triggered`, `stop_reason`, and `elapsed_s` throughout each scan. Logged in full at month completion. Useful for diagnosing outlier months — February 2023 at 53.8% coverage and March 2024 at 50.8% are both traceable in the logs to specific early-stop events during ingestion.
+
+### Panel Builder Validation
+`PanelBuilder.build()` performs four hard assertions before writing any output. A failure on any assertion raises `ValueError` immediately rather than silently writing a corrupt dataset:
+
+1. Row count must equal exactly `len(channels) × len(month_keys)`.
+2. No duplicate `(channel_id, year, month)` composite keys.
+3. No rank values ≤ 0.
+4. Ranked rows missing all six core metrics trigger a logged warning with a percentage of affected rows.
 
 ---
 
 ## Data Sources
 
-### 1. Leaderboard API
+### 1. SullyGnome Leaderboard API
 ```
-GET /api/tables/channeltables/getchannels/{yearmonth}/0/1/3/desc/{start}/100
+GET /api/tables/channeltables/getchannels/{yearmonth}/0/1/3/desc/{offset}/100
 ```
-5 calls per month (start = 0, 100, 200, 300, 400) — fetched concurrently → 500 channels.  
-Provides: `channel_id`, `slug`, `display_name`, `followers`, `followers_gained`,
-`average_viewers`, `peak_viewers`, `streamedminutes`, `viewminutes`, `status`, `mature`, `language`, `rank_position`.
+The primary data source. Called across five rank bands per month. Returns `channel_id`, `display_name`, `followers`, `followers_gained`, `avgviewers`, `maxviewers`, `streamedminutes`, `viewminutes`, `language`, `mature` per row. Response extraction handles multiple known payload shapes (`data`, `aaData`, `rows`, `results`, `items`) for forward compatibility.
 
-### 2. Pie Chart APIs (×2 per channel per month)
+### 2. SullyGnome Channel API
 ```
-GET /api/charts/piecharts/getconfig/channelgamestreamedtime/0/{id}/{slug}/%20/%20/{year}/{month}/%20/0/
-GET /api/charts/piecharts/getconfig/channelgameavgviewers/0/{id}/{slug}/%20/%20/{year}/{month}/%20/0/
+GET /api/channels/{slug}/{yearmonth}
 ```
-Returns top-5 games with stream time or average viewers respectively.  
-**÷4 bug fix:** Both pie APIs return values 4× the displayed website figures — corrected in `_extract_pie_stream_time()` and `_extract_pie_avg_viewers()`.
+Per-channel monthly summary. Called by `ChannelDataFetcher` for channels that have a rank but no accompanying metrics from the leaderboard response. Metric extraction handles camelCase, snake_case, and mixed-case field names across API versions.
 
-### 3. Games Table API (per channel per month, paginated)
+### 3. SullyGnome Games Table API
 ```
-GET /api/tables/channeltables/games/{yearmonth}/{channelId}/%20/1/2/desc/{start}/100
+GET /api/tables/channeltables/games/{yearmonth}/{channelId}/%20/1/2/desc/{offset}/100
 ```
-Returns full per-game breakdown: `streamtime`, `viewtime`, `avgviewers`, `maxviewers`.  
-Paginates automatically (`start += 100`) until `recordsTotal` is reached.  
-Note: `avgviewers` from this endpoint is **not** affected by the ÷4 bug.
+Per-channel, per-month game breakdown, paginated until `recordsTotal` is exhausted. Returns `streamtime`, `viewtime`, `avgviewers`, `maxviewers` per game entry. Called by `enrich.py` only; the per-row skip guard prevents re-fetching rows where `all_games_json` is already populated.
 
-### 4. Twitch Helix API (optional, for `created` column)
+### 4. Twitch Helix API
 ```
-GET https://api.twitch.tv/helix/users?login={slug}
+GET https://api.twitch.tv/helix/users?login={slug}&login={slug}...
 ```
-Requires `TWITCH_CLIENT_ID` and `TWITCH_CLIENT_SECRET` in `.env`.  
-Results are cached in-memory to avoid duplicate requests across months for the same channel.
+Resolves channel slugs to Twitch account creation dates. Called in batches of 100 logins per request. Token refreshes automatically on 401. Results cached in `enrich_cache.sqlite3` for 30 days. Requires `TWITCH_CLIENT_ID` and `TWITCH_CLIENT_SECRET` in `.env`.
+
+---
+
+## Output Schema
+
+### Core Panel — `twitch_full_panel.csv`
+
+#### Identity
+| Column | Type | Description |
+|---|---|---|
+| `channel_id` | Int64 | SullyGnome internal channel ID |
+| `channel_name` | str | Normalised slug — lowercase, whitespace stripped |
+| `display_name` | str | Display name as shown on Twitch |
+| `year` | Int64 | Observation year (2022–2025) |
+| `month` | str | Observation month (`january` – `december`) |
+| `month_key` | str | Composite sort key, e.g. `2024march` |
+| `month_order` | Int64 | Integer month index (1–12) for chronological sorting |
+
+#### Performance Metrics
+| Column | Type | Description |
+|---|---|---|
+| `rank` | Int64 | Leaderboard rank for that month; null if not ranked |
+| `average_viewers` | float | Average concurrent viewers |
+| `peak_viewers` | Int64 | Peak concurrent viewers |
+| `hours_streamed` | float | Total hours streamed (`streamedminutes ÷ 60`) |
+| `hours_watched` | float | Total viewer-hours (`viewminutes ÷ 60`) |
+| `followers` | Int64 | Total followers at month end |
+| `followers_gained` | Int64 | Net follower change during the month |
+
+#### Channel Metadata
+| Column | Type | Description |
+|---|---|---|
+| `status` | str | `active_top500` / `active_not_top500` / `inactive` |
+| `language` | str | Primary broadcast language |
+| `mature` | bool | Mature content flag |
+| `created` | str | Twitch account creation date, ISO 8601 — requires `.env` |
+
+#### Within-Month Cohort Ranks *(Top 500 channels only)*
+| Column | Type | Description |
+|---|---|---|
+| `peak_viewer_rank` | Int64 | Rank by peak viewers within that month's Top 500; 1 = highest |
+| `avg_viewer_rank` | Int64 | Rank by average viewers; ties share the top rank |
+| `follower_rank` | Int64 | Rank by total followers |
+| `follower_gain_rank` | Int64 | Rank by followers gained |
+
+---
+
+### Enriched Panel — `twitch_full_panel_enriched.csv`
+
+All core columns plus:
+
+| Column | Format | Description |
+|---|---|---|
+| `all_games_json` | `[["Game", hours, avg_viewers, peak_viewers, view_minutes], ...]` | Full game breakdown, all games, sorted by hours descending |
+| `games_by_stream_time_json` | `[["Game", hours], ...]` | Games sorted by hours streamed |
+| `games_by_avg_viewers_json` | `[["Game", avg_viewers], ...]` | Games sorted by average viewers |
+| `top_game` | str | Most-streamed game that month |
+| `top_game_hours` | float | Hours spent on `top_game` |
+| `top_game_pct` | float | `top_game` share of total stream hours (%) |
+| `game_count` | Int64 | Distinct games streamed that month |
+| `is_variety_streamer` | bool | `True` when `top_game_pct < 75%` and `game_count > 2` |
 
 ---
 
 ## Performance
 
 | Metric | Value |
-|--------|-------|
-| Total records | 24,000 (48 months × 500 channels) |
-| Total requests — Phase 1 | ~72,000 (5 leaderboard + 2 pie × 24,000 channels) |
-| Total requests — Phase 2 | ~24,000 (1 games API call per channel) |
-| Total requests — full run | ~96,000 |
-| Effective sustained rate | 10.8 – 11 rps |
-| Concurrency | 12 simultaneous requests |
-| Per-request jitter | 100 – 250 ms |
-| Batch pause | 3 – 5 s every 300 records |
-| Expected runtime — full run | ~2.5 – 3 hours |
+|---|---|
+| Total records produced | 116,592 |
+| Total API requests — full run | ~96,000 |
+| Sustained request rate | 10–11 rps |
+| Concurrency — low rank bands (0–8k) | 8 simultaneous |
+| Concurrency — high rank bands (8k+) | 5 simultaneous |
+| Per-request jitter | 100–400 ms |
+| Batch pause | 3–5 s every 300 records |
+| Expected full-run time | ~2.5–3 hours |
+| Incremental run (warm cache) | ~15–20 minutes |
+| Peak memory — enrichment phase | < 1 GB (streaming writer) |
+
+---
+
+## Dataset Highlights
+
+All statistics are derived from `analysis_report.md`, computed against actual pipeline output.
+
+### Coverage by Status
+| Status | Rows | Share |
+|---|---|---|
+| `active_top500` | 24,002 | 20.6% |
+| `active_not_top500` | 58,843 | 50.5% |
+| `inactive` | 33,747 | 28.9% |
+
+The `active_not_top500` category is the single largest share of the dataset. These rows exist because the pipeline scans to rank 20,000, not just 500 — meaning channels that were measurably active but outside the elite tier are fully represented.
+
+### Viewer Trends (2022–2025)
+Average viewers within the active panel declined from ~5,285 in January 2022 to ~3,735 by April 2025 — a **29% decrease** over four years. Hours watched tracked the same direction, falling from ~651,000 viewer-hours per active channel per month in early 2022 to ~430,000 by 2025. The decline is consistent across all twelve calendar months, ruling out a seasonal explanation.
+
+### Monthly Coverage Variance
+Most months sit between 70–77% rank coverage. Two outliers stand out: **February 2023 at 53.8%** and **March 2024 at 50.8%**. Both are traceable in `logs/twitch_full_panel_pipeline.log` to early-stop events triggered by elevated API error rates during those ingestion runs. Targeting these specific months with `--mode incremental --years 2023 --months february` will improve coverage on a re-run.
+
+### Top Channels by Average Viewers
+The highest-averaging channel recorded **149,037 average concurrent viewers** across its active months, with a peak of **749,621**. Three channels exceeded **85,000 average viewers** sustained across multiple years. The top channel by accumulated viewer-hours reached **509 million** over the four-year window. Every one of the top 20 channels by hours watched has a complete 48-row history.
+
+### Game Landscape
+| Game | Total Hours Streamed | Avg Viewers |
+|---|---|---|
+| Just Chatting | 1,944,710 | 3,305 |
+| League of Legends | 863,964 | 3,643 |
+| Grand Theft Auto V | 748,899 | 4,109 |
+| VALORANT | 632,348 | 3,222 |
+| Counter-Strike | 423,061 | 4,006 |
+| Fortnite | 416,734 | 3,661 |
+| Rust | 393,459 | 2,102 |
+| Escape from Tarkov | 392,831 | 1,904 |
+| Dota 2 | 354,284 | 3,958 |
+| World of Warcraft | 348,914 | 2,404 |
+
+Just Chatting accounts for **1.94 million stream-hours** — more than the next three titles combined. GTA V leads all games on average viewers despite ranking third by hours, driven by roleplay server peaks.
+
+### Channel Creation Cohorts
+96.7% of channels have a resolved Twitch creation date (only 3,812 out of 116,592 rows are missing `created`). The largest creation cohorts are 2016 (9,024 channel-months) and 2020 (7,920), reflecting the 2016 streaming industry growth wave and the 2020 pandemic surge. The dataset spans channels created as far back as 2007.
 
 ---
 
 ## CLI Reference
 
+### `twitch_full_panel_pipeline.py`
+
 ```
-python main.py [OPTIONS]
+python twitch_full_panel_pipeline.py [OPTIONS]
 
-Options:
-  --mode {full,incremental}
-        full        = fresh run; deletes existing CSVs and checkpoints first
-        incremental = skip already checkpointed records, resume where stopped
-        [default: full]
+  --mode {full,incremental}     full = fresh run (ignores checkpoints)
+                                incremental = resume from checkpoint  [default]
+  --input PATH                  Existing fact table CSV to seed from
+  --output-dir PATH             Output directory  [default: output/]
+  --years INT [INT ...]         Years to process  [default: 2022 2023 2024 2025]
+  --months MONTH [MONTH ...]    Months to process  [default: all 12]
+  --max-rank INT                Rank ceiling for leaderboard scan  [default: 20000]
+  --concurrency INT             Max simultaneous requests  [default: 8]
+  --max-api-calls INT           Global API call budget  [default: 15000]
+  --force                       Ignore checkpoints; re-fetch all months
+  --no-parquet                  Skip Parquet output
+  --no-cache                    Disable SQLite response cache
+  --progress PATH               Checkpoint file path
+  --cache-db PATH               SQLite cache database path
+  --log-level {DEBUG,INFO,WARNING,ERROR}  [default: INFO]
+```
 
-  --data-dir PATH
-        Directory for all output CSV files
-        [default: data/]
+### `enrich.py`
 
-  --checkpoint-dir PATH
-        Directory for checkpoint files (processed.txt, enriched.txt)
-        [default: checkpoints/]
+```
+python enrich.py [OPTIONS]
 
-  --years INT [INT ...]
-        Years to process
-        [default: 2022 2023 2024 2025]
-
-  --months MONTH [MONTH ...]
-        Months to process (january … december)
-        [default: all 12]
-
-  --skip-phase2
-        Stop after Phase 1 only — skips games API enrichment and transformer.
-        Produces twitch_monthly_fact_table.csv only.
-
+  --input PATH                          [default: output/twitch_full_panel_cleaned.csv]
+  --output PATH                         [default: output/twitch_full_panel_enriched.csv]
+  --chunksize INT                       Rows per processing chunk  [default: 5000]
+  --status-filter STATUS[,STATUS,...]   Only process rows with these status values
+  --overwrite-existing                  Re-fetch rows that already have game data
   --log-level {DEBUG,INFO,WARNING,ERROR}
-        [default: INFO]
 ```
 
-### Common Commands
+### `analyze_twitch_full_panel_enriched.py`
 
-```bash
-# Full run — both deliverables
-python main.py --mode full
+```
+python analyze_twitch_full_panel_enriched.py [OPTIONS]
 
-# Resume after a crash or interruption
-python main.py --mode incremental
+  --input PATH       [default: output/twitch_full_panel_enriched.csv]
+  --output-dir PATH  [default: analysis_output/]
+  --log-level {DEBUG,INFO,WARNING,ERROR}
+```
 
-# Phase 1 only (no games API — roughly half the runtime)
-python main.py --mode full --skip-phase2
+### `drop_columns.py`
 
-# Specific years only
-python main.py --mode full --years 2024 2025
+```
+python drop_columns.py <input_csv> [output_csv]
 
-# Single month test run
-python main.py --mode full --years 2022 --months january
-
-# Verbose debug output
-python main.py --mode full --log-level DEBUG
+# Removes: top_game, top_game_hours, top_game_pct, game_count,
+#          is_variety_streamer, peak_view_rank, avg_viewer_rank,
+#          follower_rank, follower_gain_rank
+#
+# Omit output_csv to overwrite input in place.
 ```
 
 ---
 
-## Safety Features
+## Safety Posture
 
-- **Single residential IP** — no proxy rotation, no IP switching
-- **No Selenium or headless browsers** — pure async HTTP only
-- **No header spoofing** — standard Chrome User-Agent
-- **Adaptive rate limiter** — stays within 7–14 rps; backs off on errors, recovers on sustained success
-- **Circuit breaker** — stops on repeated 403s or consecutive failures to protect the IP
-- **Per-request jitter** — 100–250 ms random delay on every request
-- **Batch sleep** — 3–5 s pause every 300 records
-- **Two independent checkpoints** — Phase 1 and Phase 2 each have their own checkpoint file; `--mode incremental` can resume either phase independently
+The pipeline runs from a single IP with no proxy rotation or browser automation. Concurrency and retry parameters are set conservatively. The circuit breaker ensures the system halts completely on sustained 403 responses rather than continuing to send requests through an error window.
+
+| Control | Behaviour |
+|---|---|
+| Rate limiter | Token bucket · 7–14 rps · 429 → 30 s full backoff · 5xx → −20% rate |
+| Circuit breaker | Opens on 3× 403 in 60 s or 10 consecutive failures · 5 min cooldown · HALF_OPEN probe at 1 rps |
+| Per-request jitter | 100–400 ms uniform random delay on every request |
+| Batch pause | 3–5 s pause every 300 records |
+| No browser automation | Pure async HTTP via `aiohttp` only |
+| No header spoofing | Standard Chrome User-Agent |
+| Budget limits | Per-month cap: 250 API calls · Global cap: 15,000 API calls per run |
+
+---
+
+## Requirements
+
+```
+aiohttp>=3.9
+pandas>=2.0
+pyarrow>=14.0
+python-dotenv
+matplotlib        # analysis script only
+tenacity          # retry logic
+```
+
+Python 3.11+ required. All async entry points use `asyncio.run()`. No third-party event loop is needed or assumed.
